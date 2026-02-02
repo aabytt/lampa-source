@@ -4,7 +4,7 @@ const http = require("http");
 const https = require("https");
 const { URL } = require("url");
 
-const service = new Service("kodi.lampa.tv.kodibridge");
+const service = new Service("com.lampa.tv.kodibridge");
 
 const KODI_RPC = "http://127.0.0.1:8080/jsonrpc";
 
