@@ -792,18 +792,28 @@ function start(data, need, inner){
         }
         else inner()
     }
-    else if(Platform.is('webos') && (Storage.field(player_need) == 'webos' || launch_player == 'webos')){
+    else if (Platform.is('webos') && (Storage.field(player_need) === 'webos' || Storage.field(player_need) === 'kodi' || launch_player === 'webos' || launch_player === 'kodi')){
         Preroll.show(data,()=>{
-            runWebOS({
-                need: 'com.webos.app.photovideo',
-                url: data.url.replace('&preload','&play'),
-                name: data.path || data.title,
-                position: data.timeline ? (data.timeline.time || -1) : -1
-            })
-
-            listener.send('external',data)
+            if (Storage.field(player_need) == 'webos' || launch_player == 'webos'){
+                runWebOS({
+                    need: 'com.webos.app.photovideo',
+                    url: data.url.replace('&preload','&play'),
+                    name: data.path || data.title,
+                    position: data.timeline ? (data.timeline.time || -1) : -1
+                })
+            }
+            if (Storage.field(player_need) === 'kodi' || launch_player === 'kodi') {
+                runKodiWebOS({
+                    need: 'org.xbmc.kodi',
+                    url: data.url.replace('&preload', '&play'),
+                    name: data.path || data.title,
+                    position: data.timeline ? (data.timeline.time || -1) : -1
+                })
+            }
+    
+            listener.send('external', data)
         })
-    } 
+    }    
     else if(Platform.is('android') && (Storage.field(player_need) == 'android' || launch_player == 'android' || data.torrent_hash)){
         data.url   = data.url.replace('&preload','&play')
         data.title = Utils.clearHtmlTags(data.title || '').trim()
