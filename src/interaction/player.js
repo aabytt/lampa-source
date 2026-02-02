@@ -613,6 +613,33 @@ function runWebOS(params){
 }
 
 /**
+ * Запустить Kodi плеер на webos
+ * @param {Object} params 
+ */
+function runKodiWebOS(params){
+  webOS.service.request("luna://com.lampa.tv.kodibridge", {
+    method: "playAsync",
+    subscribe: true,
+    parameters: {
+      url: params.url,
+      subscribe: true,
+      intervalMs: 250,
+      timeoutMs: 20000,
+      pingTimeoutMs: 20000
+    },
+    onSuccess: (res) => {
+      console.log("kodibridge:", res);
+    },
+    onFailure: (err) => console.error("kodibridge err:", err)
+  });
+
+  webOS.service.request("luna://com.webos.service.applicationmanager", {
+    method: "launch",
+    parameters: { id: params.need }
+  });    
+}
+
+/**
  * Показать предзагрузку торрента
  * @param {Object} data 
  * @param {Function} call 
