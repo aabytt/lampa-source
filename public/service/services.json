@@ -1,0 +1,10 @@
+{
+  "id": "com.lampa.tv.kodibridge",
+  "services": [
+    {
+      "name": "kodi-bridge",
+      "description": "Launch Kodi and open URL via Kodi JSON-RPC with retries",
+      "scripts": "kodi-bridge.js"
+    }
+  ]
+}
