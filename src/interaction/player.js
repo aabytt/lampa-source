@@ -630,12 +630,22 @@ function runKodiWebOS(params){
     onSuccess: (res) => {
       console.log("kodibridge:", res);
     },
-    onFailure: (err) => console.error("kodibridge err:", err)
+    onFailure: (err) => {
+      console.error("kodibridge err:", err);
+      Lampa.Noty.show('Kodi Bridge not available');
+    }
   });
 
   webOS.service.request("luna://com.webos.service.applicationmanager", {
     method: "launch",
-    parameters: { id: params.need }
+    parameters: { id: params.need },
+    onSuccess: (res) => {
+      console.log("app launch:", res);
+    },
+    onFailure: (err) => {
+      console.error("app launch err:", err);
+      Lampa.Noty.show('Kodi not available');
+    }
   });    
 }
 
