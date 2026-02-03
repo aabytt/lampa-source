@@ -829,7 +829,7 @@ function start(data, need, inner){
         }
         else inner()
     }
-    else if (Platform.is('webos') && (Storage.field(player_need) === 'webos' || Storage.field(player_need) === 'kodi' || launch_player === 'webos' || launch_player === 'kodi')){
+    else if (Platform.is('webos')){
         Preroll.show(data,()=>{
             if (Storage.field(player_need) == 'webos' || launch_player == 'webos'){
                 runWebOS({
@@ -839,7 +839,7 @@ function start(data, need, inner){
                     position: data.timeline ? (data.timeline.time || -1) : -1
                 })
             }
-            if (Storage.field(player_need) === 'kodi' || launch_player === 'kodi') {
+            else if (Storage.field(player_need) === 'kodi' || launch_player === 'kodi') {
                 runKodiWebOS({
                     need: 'org.xbmc.kodi',
                     url: data.url.replace('&preload', '&play'),
@@ -847,7 +847,7 @@ function start(data, need, inner){
                     position: data.timeline ? (data.timeline.time || -1) : -1
                 })
             }
-    
+            else inner() 
             listener.send('external', data)
         })
     }    
