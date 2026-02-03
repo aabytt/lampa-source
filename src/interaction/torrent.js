@@ -467,6 +467,10 @@ function list(items, params){
                 menu.push({
                     title: Lang.translate('player_lauch') + ' - WebOS',
                     player: 'webos'
+                },
+                {
+                    title: Lang.translate('player_lauch') + ' - Kodi',
+                    player: 'kodi'
                 })
             }
             
