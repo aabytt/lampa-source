@@ -1,265 +1,450 @@
-/* eslint-disable no-console */
+"use strict";
+
 const Service = require("webos-service");
-const http = require("http");
-const https = require("https");
-const { URL } = require("url");
+const WebSocket = require("ws");
 
 const service = new Service("com.lampa.tv.kodibridge");
 
-const KODI_RPC = "http://127.0.0.1:8080/jsonrpc";
-
-const DEFAULT_INTERVAL_MS = 250;
-const DEFAULT_TIMEOUT_MS = 20000;
-const DEFAULT_PING_TIMEOUT_MS = 20000;
-
-// latest-wins: новый запрос отменяет предыдущий
-let currentJob = null;
+// -------------------------
+// Helpers
+// -------------------------
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function createKeepAliveActivity() {
-  return new Promise((resolve) => {
-    service.activityManager.create("kodiBridgeKeepAlive", (activity) => resolve(activity));
-  });
+function toSecondsFromKodiTime(t) {
+  if (!t) return 0;
+  const h = Number(t.hours || 0);
+  const m = Number(t.minutes || 0);
+  const s = Number(t.seconds || 0);
+  const ms = Number(t.milliseconds || 0);
+  return h * 3600 + m * 60 + s + ms / 1000;
 }
 
-function completeKeepAliveActivity(activity) {
-  return new Promise((resolve) => {
-    if (!activity) return resolve();
-    service.activityManager.complete(activity, () => resolve());
-  });
+function pick(v, fallback) {
+  return v === undefined || v === null ? fallback : v;
 }
 
-function shrink(str, max = 500) {
-  if (!str) return "";
-  return str.length <= max ? str : str.slice(0, max) + "…";
-}
-
-function isOkResponse(data) {
-  return Boolean(data && data.jsonrpc === "2.0" && data.id === 1 && data.result === "OK");
-}
-
-function isPong(data) {
-  return Boolean(data && data.jsonrpc === "2.0" && data.id === 1 && data.result === "pong");
-}
-
-function postJson(urlStr, bodyObj, timeoutMs = 3000) {
+function lunaCall(uri, payload) {
   return new Promise((resolve, reject) => {
-    const u = new URL(urlStr);
-    const lib = u.protocol === "https:" ? https : http;
-
-    const body = JSON.stringify(bodyObj);
-
-    const req = lib.request(
-      {
-        protocol: u.protocol,
-        hostname: u.hostname,
-        port: u.port,
-        path: u.pathname + (u.search || ""),
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body),
-          "User-Agent": "webos-kodi-bridge/1.0",
-        },
-      },
-      (res) => {
-        let data = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => {
-          let json = null;
-          try {
-            json = data ? JSON.parse(data) : null;
-          } catch (e) {
-            json = null;
-          }
-          resolve({
-            okHttp: res.statusCode >= 200 && res.statusCode < 300,
-            status: res.statusCode,
-            text: data,
-            json,
-          });
-        });
+    service.call(uri, payload, (res) => {
+      if (!res) return reject(new Error("Empty Luna response"));
+      if (res.returnValue === false) {
+        const msg = res.errorText || res.errorMessage || "Luna call failed";
+        const err = new Error(msg);
+        err.code = res.errorCode;
+        return reject(err);
       }
-    );
-
-    req.on("error", (err) => reject(err));
-    req.setTimeout(timeoutMs, () => req.destroy(new Error("HTTP timeout")));
-    req.write(body);
-    req.end();
+      resolve(res);
+    });
   });
 }
 
-async function kodiPingOnce() {
-  return postJson(KODI_RPC, { jsonrpc: "2.0", method: "JSONRPC.Ping", id: 1 }, 2000);
+async function launchApp(appId, params = {}) {
+  return lunaCall("luna://com.webos.service.applicationmanager/launch", {
+    id: appId,
+    params,
+  });
 }
 
-async function kodiPlayerOpenOnce(url) {
-  return postJson(
-    KODI_RPC,
-    {
-      jsonrpc: "2.0",
-      method: "Player.Open",
-      params: { item: { file: url } },
-      id: 1,
-    },
-    4000
-  );
-}
+// -------------------------
+// Kodi JSON-RPC over WS
+// -------------------------
 
-async function waitKodiReady(job, intervalMs, timeoutMs) {
-  const started = Date.now();
-  let attempts = 0;
-  let last = null;
+class KodiWsClient {
+  constructor({ host, port, pingTimeoutMs }) {
+    this.host = host;
+    this.port = port;
+    this.pingTimeoutMs = pingTimeoutMs;
 
-  while (!job.cancelled && Date.now() - started < timeoutMs) {
-    attempts += 1;
-    try {
-      const r = await kodiPingOnce();
-      last = r;
-      if (r.json && isPong(r.json)) return { ready: true, attempts, last };
-    } catch (e) {}
-    await sleep(intervalMs);
+    this.ws = null;
+    this.nextId = 1;
+    this.pending = new Map();
+    this.lastActivityTs = Date.now();
+
+    this.pingInterval = null;
+    this.pingWatchdog = null;
+
+    this.onNotification = null;
+    this.onClose = null;
   }
 
-  return { ready: false, attempts, last };
-}
+  connect(timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const url = `ws://${this.host}:${this.port}/jsonrpc`;
+      const ws = new WebSocket(url);
 
-async function playWorker(job, url, intervalMs, timeoutMs, pingTimeoutMs) {
-  let attemptsOpen = 0;
-  let attemptsPing = 0;
-  let lastOpen = null;
-  let lastPing = null;
+      let done = false;
+      const t = setTimeout(() => {
+        if (done) return;
+        done = true;
+        try { ws.terminate(); } catch (_) {}
+        reject(new Error(`Kodi WS connect timeout (${timeoutMs}ms)`));
+      }, timeoutMs);
 
-  // 1) сразу Player.Open
-  if (!job.cancelled) {
-    attemptsOpen += 1;
-    try {
-      lastOpen = await kodiPlayerOpenOnce(url);
-      if (lastOpen.json && isOkResponse(lastOpen.json)) {
-        return { ok: true, attemptsOpen, attemptsPing, lastOpen, lastPing };
+      ws.on("open", () => {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        this.ws = ws;
+        this.lastActivityTs = Date.now();
+        this._setupWsHandlers();
+        this._startPing();
+        resolve();
+      });
+
+      ws.on("error", (err) => {
+        if (!done) {
+          done = true;
+          clearTimeout(t);
+          reject(err);
+        }
+      });
+    });
+  }
+
+  _setupWsHandlers() {
+    this.ws.on("message", (data) => {
+      this.lastActivityTs = Date.now();
+
+      let msg;
+      try {
+        msg = JSON.parse(data.toString("utf8"));
+      } catch (_) {
+        return;
       }
-    } catch (e) {}
-  }
 
-  // 2) ждём Ping->pong
-  if (!job.cancelled) {
-    const pingRes = await waitKodiReady(job, intervalMs, pingTimeoutMs);
-    attemptsPing = pingRes.attempts;
-    lastPing = pingRes.last;
-  }
-
-  // 3) ретраи Player.Open
-  const startedOpenPhase = Date.now();
-  while (!job.cancelled && Date.now() - startedOpenPhase < timeoutMs) {
-    await sleep(intervalMs);
-    attemptsOpen += 1;
-
-    try {
-      lastOpen = await kodiPlayerOpenOnce(url);
-      if (lastOpen.json && isOkResponse(lastOpen.json)) {
-        return { ok: true, attemptsOpen, attemptsPing, lastOpen, lastPing };
+      // response
+      if (msg && msg.id !== undefined) {
+        const pending = this.pending.get(msg.id);
+        if (pending) {
+          this.pending.delete(msg.id);
+          clearTimeout(pending.timeout);
+          if (msg.error) {
+            const err = new Error(msg.error.message || "Kodi RPC error");
+            err.code = msg.error.code;
+            pending.reject(err);
+          } else {
+            pending.resolve(msg.result);
+          }
+        }
+        return;
       }
-    } catch (e) {}
+
+      // notification
+      if (msg && msg.method && msg.params && typeof this.onNotification === "function") {
+        this.onNotification(msg.method, msg.params);
+      }
+    });
+
+    this.ws.on("pong", () => {
+      this.lastActivityTs = Date.now();
+    });
+
+    this.ws.on("close", () => {
+      this._stopPing();
+
+      for (const [id, pending] of this.pending.entries()) {
+        clearTimeout(pending.timeout);
+        pending.reject(new Error("Kodi WS closed"));
+      }
+      this.pending.clear();
+
+      if (typeof this.onClose === "function") this.onClose();
+    });
+
+    this.ws.on("error", () => {});
   }
 
-  return { ok: false, attemptsOpen, attemptsPing, lastOpen, lastPing };
+  _startPing() {
+    this.pingInterval = setInterval(() => {
+      if (!this.ws) return;
+      try { this.ws.ping(); } catch (_) {}
+    }, 5000);
+
+    this.pingWatchdog = setInterval(() => {
+      const silentMs = Date.now() - this.lastActivityTs;
+      if (silentMs > this.pingTimeoutMs) {
+        try { this.ws.terminate(); } catch (_) {}
+      }
+    }, 1000);
+  }
+
+  _stopPing() {
+    if (this.pingInterval) clearInterval(this.pingInterval);
+    if (this.pingWatchdog) clearInterval(this.pingWatchdog);
+    this.pingInterval = null;
+    this.pingWatchdog = null;
+  }
+
+  request(method, params, timeoutMs = 8000) {
+    return new Promise((resolve, reject) => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        return reject(new Error("Kodi WS not connected"));
+      }
+
+      const id = this.nextId++;
+      const payload = { jsonrpc: "2.0", id, method, params: params || {} };
+
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Kodi RPC timeout: ${method}`));
+      }, timeoutMs);
+
+      this.pending.set(id, { resolve, reject, timeout });
+
+      try {
+        this.ws.send(JSON.stringify(payload));
+      } catch (err) {
+        clearTimeout(timeout);
+        this.pending.delete(id);
+        reject(err);
+      }
+    });
+  }
+
+  close() {
+    this._stopPing();
+    if (this.ws) {
+      try { this.ws.close(); } catch (_) {}
+      this.ws = null;
+    }
+  }
 }
 
-/**
- * playAsync:
- * - если subscribe:true → шлём STARTED, а потом FINAL (OK/TIMEOUT/CANCELLED) в этот же callback
- * - если subscribe:false → просто отвечаем STARTED и всё
- */
-service.register("playAsync", async (message) => {
-  const p = message.payload || {};
-  const url = p.url;
+// -------------------------
+// Main method: playAsync
+// -------------------------
 
-  if (!url || typeof url !== "string") {
-    message.respond({ returnValue: false, errorText: "Missing or invalid 'url' string" });
+service.register("playAsync", async (msg) => {
+  // Must be subscription (we stream events)
+  if (!msg.isSubscription) {
+    msg.respond({ returnValue: false, errorText: "subscribe:true is required" });
     return;
   }
 
-  const intervalMs = Number(p.intervalMs) > 0 ? Number(p.intervalMs) : DEFAULT_INTERVAL_MS;
-  const timeoutMs = Number(p.timeoutMs) > 0 ? Number(p.timeoutMs) : DEFAULT_TIMEOUT_MS;
-  const pingTimeoutMs = Number(p.pingTimeoutMs) > 0 ? Number(p.pingTimeoutMs) : DEFAULT_PING_TIMEOUT_MS;
+  const p = msg.payload || {};
 
-  // важное: подписка определяется полем subscribe в payload (UI должен передать subscribe:true)
-  const subscribed = Boolean(p.subscribe);
+  const kodiAppId = pick(p.need, "org.xbmc.kodi");
+  const lampaAppId = "com.lampa.tv";
 
-  // отменяем предыдущий job
-  if (currentJob) currentJob.cancelled = true;
+  // Defaults (same-device)
+  const kodiHost = pick(p.kodiHost, "127.0.0.1");
+  const kodiWsPort = pick(p.kodiWsPort, 9090);
 
-  const job = { cancelled: false, url, startedAt: Date.now() };
-  currentJob = job;
+  const intervalMs = Math.max(100, pick(p.intervalMs, 250));
+  const timeoutMs = Math.max(1000, pick(p.timeoutMs, 20000));
+  const pingTimeoutMs = Math.max(1000, pick(p.pingTimeoutMs, 20000));
 
-  // если клиент подписался — держим канал открытым
-  if (subscribed) {
-    // webos-service поддерживает subscriptions так:
-    // сохраняем "subscription" на message и отвечаем несколько раз
-    message.subscription = true;
-  }
+  let endedOrStopped = false;
+  let playerId = null;
+  let pollTimer = null;
 
-  // 1) сразу сообщаем "started"
-  message.respond({ returnValue: true, stage: "STARTED", url });
+  // last known values
+  let lastKnownPos = 0;
+  let lastKnownDur = 0;
+  let lastKnownSpeed = 0;
 
-  // если подписки нет — на этом всё (в фоне отработаем, но в аппку финал не отправим)
-  if (!subscribed) {
-    // всё равно можем выполнить, но это уже "немо"
-  }
+  const respond = (obj) => {
+    try {
+      msg.respond({ returnValue: true, subscribed: true, ...obj });
+    } catch (_) {}
+  };
 
-  let keepAlive = null;
+  const cleanup = () => {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = null;
+  };
 
+  const bringFocusBackToLampa = async (extra = {}) => {
+    try {
+      await launchApp(lampaAppId, { from: "kodibridge", ...extra });
+    } catch (_) {}
+  };
+
+  const fail = async (message, code) => {
+    if (endedOrStopped) return;
+    endedOrStopped = true;
+
+    cleanup();
+    await bringFocusBackToLampa({ error: message, position: lastKnownPos });
+
+    respond({
+      type: "error",
+      message,
+      code: code || "ERR",
+      position: lastKnownPos,
+      duration: lastKnownDur,
+      speed: lastKnownSpeed,
+    });
+  };
+
+  // 1) LAUNCH KODI IMMEDIATELY (fastest perceived start)
   try {
-    keepAlive = await createKeepAliveActivity();
+    await launchApp(kodiAppId, { from: "kodibridge" });
+    respond({ type: "launched", appId: kodiAppId });
+  } catch (_) {
+    await fail(`Kodi not available (${kodiAppId})`, "KODI_LAUNCH_FAILED");
+    return true;
+  }
 
-    const r = await playWorker(job, url, intervalMs, timeoutMs, pingTimeoutMs);
+  // 2) Validate inputs AFTER launch (as requested)
+  const url = p.url;
+  const name = pick(p.name, "");
+  const position = Number.isFinite(p.position) ? p.position : -1;
 
-    // если job отменён — финал "CANCELLED"
-    if (job.cancelled) {
-      if (subscribed) {
-        message.respond({ returnValue: false, stage: "FINAL", result: "CANCELLED", url });
-      }
-      return;
+  if (!url || typeof url !== "string") {
+    await fail("Missing parameters.url", "BAD_ARGS");
+    return true;
+  }
+
+  // Give Kodi a brief moment to start WS (tune if needed)
+  await sleep(150);
+
+  const kodi = new KodiWsClient({ host: kodiHost, port: kodiWsPort, pingTimeoutMs });
+
+  kodi.onClose = async () => {
+    if (!endedOrStopped) {
+      await fail("Kodi connection closed", "KODI_WS_CLOSED");
+    }
+  };
+
+  const getFinalPropsSafe = async () => {
+    if (!kodi || playerId === null || playerId === undefined) {
+      return { position: lastKnownPos, duration: lastKnownDur, speed: lastKnownSpeed };
+    }
+    try {
+      const props = await kodi.request(
+        "Player.GetProperties",
+        { playerid: playerId, properties: ["time", "totaltime", "speed"] },
+        2500
+      );
+      const pos = toSecondsFromKodiTime(props.time);
+      const dur = toSecondsFromKodiTime(props.totaltime);
+      const speed = Number(props.speed || 0);
+
+      lastKnownPos = pos;
+      lastKnownDur = dur;
+      lastKnownSpeed = speed;
+
+      return { position: pos, duration: dur, speed };
+    } catch (_) {
+      return { position: lastKnownPos, duration: lastKnownDur, speed: lastKnownSpeed };
+    }
+  };
+
+  // 3) Connect WS
+  try {
+    await kodi.connect(timeoutMs);
+  } catch (_) {
+    kodi.close();
+    await fail(`Cannot connect to Kodi JSON-RPC WS at ${kodiHost}:${kodiWsPort}`, "KODI_WS_CONNECT_FAILED");
+    return true;
+  }
+
+  // 4) Notifications
+  kodi.onNotification = async (method, params) => {
+    if (endedOrStopped) return;
+
+    if (method === "Player.OnAVStart") return respond({ type: "avstart" });
+    if (method === "Player.OnPause") return respond({ type: "paused" });
+    if (method === "Player.OnResume") return respond({ type: "resumed" });
+
+    if (method === "Player.OnSeek") {
+      return respond({ type: "seek", position: lastKnownPos, duration: lastKnownDur, speed: lastKnownSpeed });
     }
 
-    const finalPayload = {
-      returnValue: r.ok,
-      stage: "FINAL",
-      result: r.ok ? "OK" : "TIMEOUT",
-      url,
-      attemptsOpen: r.attemptsOpen,
-      attemptsPing: r.attemptsPing,
-      lastPing: r.lastPing
-        ? { status: r.lastPing.status, json: r.lastPing.json, text: shrink(r.lastPing.text) }
-        : null,
-      lastOpen: r.lastOpen
-        ? { status: r.lastOpen.status, json: r.lastOpen.json, text: shrink(r.lastOpen.text) }
-        : null,
-    };
+    if (method === "Player.OnStop") {
+      endedOrStopped = true;
+      cleanup();
 
-    // 2) отправляем финал в аппку, если есть подписка
-    if (subscribed) {
-      message.respond(finalPayload);
-    }
-  } catch (e) {
-    if (subscribed) {
-      message.respond({
-        returnValue: false,
-        stage: "FINAL",
-        result: "ERROR",
-        errorText: String(e && e.message ? e.message : e),
-        url,
+      const end = !!(params && params.data && params.data.end);
+      const finalProps = await getFinalPropsSafe();
+
+      kodi.close();
+
+      await bringFocusBackToLampa({
+        stopped: true,
+        position: finalProps.position,
+        duration: finalProps.duration,
+        end,
+      });
+
+      respond({
+        type: "stopped",
+        position: finalProps.position,
+        duration: finalProps.duration,
+        end,
       });
     }
-  } finally {
-    try {
-      await completeKeepAliveActivity(keepAlive);
-    } catch (e) {}
+  };
 
-    if (currentJob === job) currentJob = null;
+  // 5) Start playback
+  try {
+    await kodi.request(
+      "Player.Open",
+      { item: { file: url }, options: { resume: false } },
+      timeoutMs
+    );
+
+    await sleep(200);
+
+    // get active player id (retry)
+    for (let i = 0; i < 12; i++) {
+      const active = await kodi.request("Player.GetActivePlayers", {}, 3000);
+      if (Array.isArray(active) && active.length > 0) {
+        playerId = active[0].playerid;
+        break;
+      }
+      await sleep(150);
+    }
+
+    if (playerId === null || playerId === undefined) {
+      throw new Error("No active player after Player.Open");
+    }
+
+    if (Number.isFinite(position) && position >= 0) {
+      await kodi.request("Player.Seek", { playerid: playerId, value: position }, 8000);
+    }
+
+    respond({ type: "playing", name, position: Math.max(0, position) });
+  } catch (err) {
+    kodi.close();
+    await fail(`Kodi play failed: ${err.message}`, "KODI_PLAY_FAILED");
+    return true;
   }
+
+  // 6) Poll progress
+  pollTimer = setInterval(async () => {
+    if (endedOrStopped) return;
+
+    try {
+      const props = await kodi.request(
+        "Player.GetProperties",
+        { playerid: playerId, properties: ["time", "totaltime", "speed"] },
+        5000
+      );
+
+      const pos = toSecondsFromKodiTime(props.time);
+      const dur = toSecondsFromKodiTime(props.totaltime);
+      const speed = Number(props.speed || 0);
+
+      lastKnownPos = pos;
+      lastKnownDur = dur;
+      lastKnownSpeed = speed;
+
+      respond({ type: "progress", position: pos, duration: dur, speed });
+    } catch (err) {
+      kodi.close();
+      await fail(`Kodi tracking failed: ${err.message}`, "KODI_TRACK_FAILED");
+    }
+  }, intervalMs);
+
+  return true; // keep subscription open
+});
+
+// Optional health check
+service.register("ping", (msg) => {
+  msg.respond({ returnValue: true, ok: true, service: "com.lampa.tv.kodibridge" });
 });
