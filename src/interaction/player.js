@@ -621,32 +621,50 @@ function runKodiWebOS(params){
     method: "playAsync",
     subscribe: true,
     parameters: {
+      need: params.need || "org.xbmc.kodi",
       url: params.url,
-      subscribe: true,
-      intervalMs: 250,
-      timeoutMs: 20000,
-      pingTimeoutMs: 20000
+      name: params.name || "",
+      position: Number.isFinite(params.position) ? params.position : -1,
+      // optional tuning
+      intervalMs: params.intervalMs ?? 250,
+      timeoutMs: params.timeoutMs ?? 20000,
+      pingTimeoutMs: params.pingTimeoutMs ?? 20000
     },
+
     onSuccess: (res) => {
+      // subscription stream: many callbacks
       console.log("kodibridge:", res);
+      if (!res || !res.type) return;
+      if (res.type === "error") {
+        // Service already brings focus back to com.lampa.tv
+        if (typeof Lampa !== "undefined" && Lampa.Noty) {
+          Lampa.Noty.show(res.message || "Kodi error");
+        }
+        return;
+      }
+      if (res.type === "stopped") {
+        // integrate later with Lampa timeline storage.
+        // res.position (seconds) is the final resume time
+        // res.duration (seconds)
+        // res.end (bool)
+        console.log("Kodi stopped at:", res.position, "duration:", res.duration, "end:", res.end);
+
+        // Future integration point:
+        // Lampa.Timeline.save({ url: params.url, time: res.position, ... })
+        return;
+      }
+
+      // Optional: handle progress to show UI or update temporary state
+      // if (res.type === "progress") { ... }
     },
+
     onFailure: (err) => {
       console.error("kodibridge err:", err);
-      Lampa.Noty.show('Kodi Bridge not available');
+      if (typeof Lampa !== "undefined" && Lampa.Noty) {
+        Lampa.Noty.show("Kodi Bridge not available");
+      }
     }
   });
-
-  webOS.service.request("luna://com.webos.service.applicationmanager", {
-    method: "launch",
-    parameters: { id: params.need },
-    onSuccess: (res) => {
-      console.log("app launch:", res);
-    },
-    onFailure: (err) => {
-      console.error("app launch err:", err);
-      Lampa.Noty.show('Kodi not available');
-    }
-  });    
 }
 
 /**
