@@ -6,6 +6,11 @@ const WebSocket = require("ws");
 const service = new Service("com.lampa.tv.kodibridge");
 
 // -------------------------
+// Global: one active session (preempt previous)
+// -------------------------
+let ACTIVE_SESSION = null; // { stop(reason) }
+
+// -------------------------
 // Helpers
 // -------------------------
 
@@ -60,17 +65,44 @@ class KodiWsClient {
 
     this.ws = null;
     this.nextId = 1;
-    this.pending = new Map();
+    this.pending = new Map(); // id -> {resolve,reject,timeout}
     this.lastActivityTs = Date.now();
 
     this.pingInterval = null;
     this.pingWatchdog = null;
 
-    this.onNotification = null;
-    this.onClose = null;
+    this.onNotification = null; // (method, params) => void
+    this.onClose = null; // () => void
   }
 
-  connect(timeoutMs) {
+  async connectWithRetry(totalTimeoutMs) {
+    const start = Date.now();
+    let attempt = 0;
+    let lastErr = null;
+
+    while (Date.now() - start < totalTimeoutMs) {
+      attempt++;
+      try {
+        // per-attempt timeout: small and grows a bit
+        const perAttempt = Math.min(1500 + attempt * 250, 4000);
+        await this.connectOnce(perAttempt);
+        return;
+      } catch (err) {
+        lastErr = err;
+        // backoff
+        const wait = Math.min(150 + attempt * 150, 800);
+        await sleep(wait);
+      }
+    }
+
+    const e = new Error(
+      lastErr ? `${lastErr.message}` : `Kodi WS connect failed within ${totalTimeoutMs}ms`
+    );
+    e.code = "KODI_WS_CONNECT_FAILED";
+    throw e;
+  }
+
+  connectOnce(timeoutMs) {
     return new Promise((resolve, reject) => {
       const url = `ws://${this.host}:${this.port}/jsonrpc`;
       const ws = new WebSocket(url);
@@ -218,10 +250,14 @@ class KodiWsClient {
 // -------------------------
 
 service.register("playAsync", async (msg) => {
-  // Must be subscription (we stream events)
   if (!msg.isSubscription) {
     msg.respond({ returnValue: false, errorText: "subscribe:true is required" });
     return;
+  }
+
+  // ---- preempt any existing session (prevents races/leaks)
+  if (ACTIVE_SESSION && typeof ACTIVE_SESSION.stop === "function") {
+    try { ACTIVE_SESSION.stop("preempted"); } catch (_) {}
   }
 
   const p = msg.payload || {};
@@ -237,19 +273,25 @@ service.register("playAsync", async (msg) => {
   const timeoutMs = Math.max(1000, pick(p.timeoutMs, 20000));
   const pingTimeoutMs = Math.max(1000, pick(p.pingTimeoutMs, 20000));
 
-  let endedOrStopped = false;
-  let playerId = null;
-  let pollTimer = null;
+  // launch first (your requirement)
+  let ended = false;
+  let cancelled = false;
 
   // last known values
+  let playerId = null;
+  let pollTimer = null;
   let lastKnownPos = 0;
   let lastKnownDur = 0;
   let lastKnownSpeed = 0;
 
   const respond = (obj) => {
+    if (ended || cancelled) return;
     try {
       msg.respond({ returnValue: true, subscribed: true, ...obj });
-    } catch (_) {}
+    } catch (_) {
+      // if respond throws, treat as cancelled to stop leaks
+      cancelled = true;
+    }
   };
 
   const cleanup = () => {
@@ -263,24 +305,67 @@ service.register("playAsync", async (msg) => {
     } catch (_) {}
   };
 
-  const fail = async (message, code) => {
-    if (endedOrStopped) return;
-    endedOrStopped = true;
+  const endSession = async (kind, payload) => {
+    if (ended) return;
+    ended = true;
 
     cleanup();
-    await bringFocusBackToLampa({ error: message, position: lastKnownPos });
 
-    respond({
+    // clear global active session if it's us
+    if (ACTIVE_SESSION && ACTIVE_SESSION._msg === msg) {
+      ACTIVE_SESSION = null;
+    }
+
+    // do not force focus on "cancel" (UI closed/unsubscribed)
+    if (kind !== "cancel") {
+      await bringFocusBackToLampa(payload && payload.focusExtra ? payload.focusExtra : {});
+    }
+
+    // for cancel we do not send any final respond (subscription is gone)
+    if (kind === "cancel") return;
+
+    respond(payload);
+  };
+
+  const fail = async (message, code) => {
+    await endSession("error", {
       type: "error",
       message,
       code: code || "ERR",
       position: lastKnownPos,
       duration: lastKnownDur,
       speed: lastKnownSpeed,
+      focusExtra: { error: message, position: lastKnownPos },
     });
   };
 
-  // 1) LAUNCH KODI IMMEDIATELY (fastest perceived start)
+  // subscription cancel handler (best-effort; varies by platform)
+  try {
+    if (typeof msg.on === "function") {
+      msg.on("cancel", () => {
+        cancelled = true;
+        cleanup();
+        if (ACTIVE_SESSION && ACTIVE_SESSION._msg === msg) {
+          try { ACTIVE_SESSION.stop("cancel"); } catch (_) {}
+          ACTIVE_SESSION = null;
+        }
+      });
+    }
+  } catch (_) {}
+
+  // create session handle so future calls can preempt us
+  const kodi = new KodiWsClient({ host: kodiHost, port: kodiWsPort, pingTimeoutMs });
+  ACTIVE_SESSION = {
+    _msg: msg,
+    stop: (reason) => {
+      // stop everything quickly
+      cancelled = reason === "cancel";
+      cleanup();
+      try { kodi.close(); } catch (_) {}
+    },
+  };
+
+  // 1) Launch Kodi immediately
   try {
     await launchApp(kodiAppId, { from: "kodibridge" });
     respond({ type: "launched", appId: kodiAppId });
@@ -289,7 +374,7 @@ service.register("playAsync", async (msg) => {
     return true;
   }
 
-  // 2) Validate inputs AFTER launch (as requested)
+  // 2) Validate args after launch
   const url = p.url;
   const name = pick(p.name, "");
   const position = Number.isFinite(p.position) ? p.position : -1;
@@ -299,16 +384,24 @@ service.register("playAsync", async (msg) => {
     return true;
   }
 
-  // Give Kodi a brief moment to start WS (tune if needed)
-  await sleep(150);
-
-  const kodi = new KodiWsClient({ host: kodiHost, port: kodiWsPort, pingTimeoutMs });
-
+  // 3) Connect WS with retry (Kodi may not be ready yet)
   kodi.onClose = async () => {
-    if (!endedOrStopped) {
+    // if not already ended/cancelled, treat as error
+    if (!ended && !cancelled) {
       await fail("Kodi connection closed", "KODI_WS_CLOSED");
     }
   };
+
+  try {
+    await kodi.connectWithRetry(timeoutMs);
+  } catch (err) {
+    kodi.close();
+    await fail(
+      `Cannot connect to Kodi JSON-RPC WS at ${kodiHost}:${kodiWsPort} (${err.message})`,
+      "KODI_WS_CONNECT_FAILED"
+    );
+    return true;
+  }
 
   const getFinalPropsSafe = async () => {
     if (!kodi || playerId === null || playerId === undefined) {
@@ -334,70 +427,55 @@ service.register("playAsync", async (msg) => {
     }
   };
 
-  // 3) Connect WS
-  try {
-    await kodi.connect(timeoutMs);
-  } catch (_) {
-    kodi.close();
-    await fail(`Cannot connect to Kodi JSON-RPC WS at ${kodiHost}:${kodiWsPort}`, "KODI_WS_CONNECT_FAILED");
-    return true;
-  }
-
   // 4) Notifications
   kodi.onNotification = async (method, params) => {
-    if (endedOrStopped) return;
+    if (ended || cancelled) return;
 
     if (method === "Player.OnAVStart") return respond({ type: "avstart" });
     if (method === "Player.OnPause") return respond({ type: "paused" });
     if (method === "Player.OnResume") return respond({ type: "resumed" });
 
     if (method === "Player.OnSeek") {
-      return respond({ type: "seek", position: lastKnownPos, duration: lastKnownDur, speed: lastKnownSpeed });
+      return respond({
+        type: "seek",
+        position: lastKnownPos,
+        duration: lastKnownDur,
+        speed: lastKnownSpeed,
+      });
     }
 
     if (method === "Player.OnStop") {
-      endedOrStopped = true;
-      cleanup();
-
       const end = !!(params && params.data && params.data.end);
       const finalProps = await getFinalPropsSafe();
+      try { kodi.close(); } catch (_) {}
 
-      kodi.close();
-
-      await bringFocusBackToLampa({
-        stopped: true,
-        position: finalProps.position,
-        duration: finalProps.duration,
-        end,
-      });
-
-      respond({
+      await endSession("stopped", {
         type: "stopped",
         position: finalProps.position,
         duration: finalProps.duration,
         end,
+        focusExtra: {
+          stopped: true,
+          position: finalProps.position,
+          duration: finalProps.duration,
+          end,
+        },
       });
     }
   };
 
   // 5) Start playback
   try {
-    await kodi.request(
-      "Player.Open",
-      { item: { file: url }, options: { resume: false } },
-      timeoutMs
-    );
+    await kodi.request("Player.Open", { item: { file: url }, options: { resume: false } }, timeoutMs);
 
-    await sleep(200);
-
-    // get active player id (retry)
-    for (let i = 0; i < 12; i++) {
+    // detect active player (retry)
+    for (let i = 0; i < 14; i++) {
       const active = await kodi.request("Player.GetActivePlayers", {}, 3000);
       if (Array.isArray(active) && active.length > 0) {
         playerId = active[0].playerid;
         break;
       }
-      await sleep(150);
+      await sleep(120);
     }
 
     if (playerId === null || playerId === undefined) {
@@ -410,21 +488,25 @@ service.register("playAsync", async (msg) => {
 
     respond({ type: "playing", name, position: Math.max(0, position) });
   } catch (err) {
-    kodi.close();
+    try { kodi.close(); } catch (_) {}
     await fail(`Kodi play failed: ${err.message}`, "KODI_PLAY_FAILED");
     return true;
   }
 
-  // 6) Poll progress
-  pollTimer = setInterval(async () => {
-    if (endedOrStopped) return;
+  // 6) Poll progress with tolerance (avoid false errors)
+  let pollFailStreak = 0;
+  const MAX_POLL_FAILS = 3;
 
+  pollTimer = setInterval(async () => {
+    if (ended || cancelled) return;
     try {
       const props = await kodi.request(
         "Player.GetProperties",
         { playerid: playerId, properties: ["time", "totaltime", "speed"] },
         5000
       );
+
+      pollFailStreak = 0;
 
       const pos = toSecondsFromKodiTime(props.time);
       const dur = toSecondsFromKodiTime(props.totaltime);
@@ -436,12 +518,15 @@ service.register("playAsync", async (msg) => {
 
       respond({ type: "progress", position: pos, duration: dur, speed });
     } catch (err) {
-      kodi.close();
-      await fail(`Kodi tracking failed: ${err.message}`, "KODI_TRACK_FAILED");
+      pollFailStreak += 1;
+      if (pollFailStreak >= MAX_POLL_FAILS) {
+        try { kodi.close(); } catch (_) {}
+        await fail(`Kodi tracking failed: ${err.message}`, "KODI_TRACK_FAILED");
+      }
     }
   }, intervalMs);
 
-  return true; // keep subscription open
+  return true;
 });
 
 // Optional health check
