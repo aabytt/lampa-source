@@ -1,9 +1,13 @@
 {
-  "name": "kodi-bridge-service",
+  "name": "com.lampa.tv.kodibridge",
   "version": "1.0.0",
+  "description": "Kodi bridge Luna service for webOS (launch + JSON-RPC control + playback tracking)",
   "main": "kodi-bridge.js",
-  "private": true,
+  "scripts": {
+    "start": "node kodi-bridge.js"
+  },
   "dependencies": {
-    "webos-service": "^1.2.10"
+    "webos-service": "^1.2.6",
+    "ws": "^8.18.0"
   }
 }
