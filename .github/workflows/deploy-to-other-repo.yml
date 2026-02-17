@@ -24,21 +24,32 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Build (one-shot for GitHub)
-        run: npx gulp pack_github
+      - name: Prebuild (generate dest/app.js)
+        run: npx gulp debug
 
-      - name: Ensure output folder exists
+      - name: Ensure dest/app.js exists
         run: |
-          # Попробуем public/ как основной кандидат
-          if [ -d "public" ]; then
-            echo "Using output folder: public/"
-            ls -la public | head -n 200
-          else
-            echo "public/ not found. Listing repo root:"
-            ls -la
-            echo "If your build outputs elsewhere, change deploy copy path."
+          if [ ! -f "dest/app.js" ]; then
+            echo "ERROR: dest/app.js not found after prebuild."
+            echo "Listing dest/ and project root:"
+            ls -la || true
+            ls -la dest || true
+            find . -maxdepth 3 -type f -name "app.js" | head -n 50 || true
             exit 1
           fi
+          ls -la dest | head -n 200
+
+      - name: Pack for GitHub
+        run: npx gulp pack_github
+
+      - name: Ensure output folder exists (public)
+        run: |
+          if [ ! -d "public" ]; then
+            echo "ERROR: public/ not found"
+            ls -la
+            exit 1
+          fi
+          ls -la public | head -n 200
 
       - name: Deploy to target repo
         run: |
@@ -48,13 +59,4 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
           rm -rf /tmp/deploy-repo
-          git clone https://x-access-token:${{ secrets.DEPLOY_TOKEN }}@github.com/aabytt/aabytt.github.io.git /tmp/deploy-repo
-
-          find /tmp/deploy-repo -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
-
-          cp -R public/. /tmp/deploy-repo/
-
-          cd /tmp/deploy-repo
-          git add -A
-          git commit -m "Deploy from $GITHUB_REPOSITORY @ $GITHUB_SHA" || echo "No changes to commit"
-          git push origin main
+          git clone https://x-access-token:${{ secrets.DEPLOY_TOKEN }}@github.com/aabytt/aaby_
