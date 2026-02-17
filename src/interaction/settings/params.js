@@ -51,16 +51,19 @@ function init(){
     else if(Platform.is('webos')){
         select('player',{
             'inner': '#{settings_param_player_inner}',
+            'kodi': 'Kodi',			
             'webos': 'WebOS',
         },'inner')
 
         select('player_iptv',{
             'inner': '#{settings_param_player_inner}',
+            'kodi': 'Kodi',			
             'webos': 'WebOS',
         },'inner')
 
         select('player_torrent',{
             'inner': '#{settings_param_player_inner}',
+            'kodi': 'Kodi',			
             'webos': 'WebOS',
         },'inner')
     }
