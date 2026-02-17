@@ -6,7 +6,7 @@
   "scripts": {
     "start": "gulp",
     "build": "gulp build",
-    "build": "gulp default"
+    "build": "gulp default",
     "debug": "gulp debug",
     "test": "vitest",
     "doc": "gulp doc"
