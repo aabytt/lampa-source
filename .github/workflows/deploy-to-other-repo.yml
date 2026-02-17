@@ -24,7 +24,8 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Build dest (run gulp debug in background, then stop)
+      # 1) Прогрев: запускаем debug (он watch), ждём, пока появится dest/app.js, и гасим процесс
+      - name: Prebuild (run gulp debug in background until dest/app.js appears)
         shell: bash
         run: |
           set -euo pipefail
@@ -60,9 +61,29 @@ jobs:
           sleep 2
           kill -9 $GULP_PID || true
 
-          echo "dest/ contents (top):"
+          echo "dest/ contents (top) after prebuild:"
           ls -la dest | head -n 200
 
+      # 2) Теперь делаем упаковку под GitHub (должна сгенерить нужные файлы, включая index.html)
+      - name: Pack for GitHub (one-shot)
+        run: npx gulp pack_github
+
+      # 3) Проверим, что в dest есть index.html (или хотя бы покажем, что там лежит)
+      - name: Verify dest output
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "dest/ contents (top) after pack_github:"
+          ls -la dest | head -n 200
+
+          if [ ! -f "dest/index.html" ]; then
+            echo "ERROR: dest/index.html not found."
+            echo "Searching for index.html in repo (maxdepth 5):"
+            find . -maxdepth 5 -name "index.html" -type f -print || true
+            exit 1
+          fi
+
+      # 4) Деплой именно dest/ в корень репозитория B
       - name: Deploy dest to target repo
         shell: bash
         run: |
@@ -74,10 +95,8 @@ jobs:
           rm -rf /tmp/deploy-repo
           git clone https://x-access-token:${{ secrets.DEPLOY_TOKEN }}@github.com/aabytt/aabytt.github.io.git /tmp/deploy-repo
 
-          # очистка всего кроме .git
           find /tmp/deploy-repo -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
 
-          # копируем СОДЕРЖИМОЕ dest в корень репо B
           cp -R dest/. /tmp/deploy-repo/
 
           cd /tmp/deploy-repo
