@@ -792,15 +792,25 @@ function start(data, need, inner){
         }
         else inner()
     }
-    else if(Platform.is('webos') && (Storage.field(player_need) == 'webos' || launch_player == 'webos')){
+    else if(Platform.is('webos')){
         Preroll.show(data,()=>{
+            if (Storage.field(player_need) == 'webos' || launch_player == 'webos'){            
             runWebOS({
                 need: 'com.webos.app.photovideo',
                 url: data.url.replace('&preload','&play'),
                 name: data.path || data.title,
                 position: data.timeline ? (data.timeline.time || -1) : -1
             })
-
+            }
+            else if (Storage.field(player_need) === 'kodi' || launch_player === 'kodi') {
+                runKodiWebOS({
+                    need: 'org.xbmc.kodi',
+                    url: data.url.replace('&preload', '&play'),
+                    name: data.path || data.title,
+                    position: data.timeline ? (data.timeline.time || -1) : -1
+                })
+            }
+            else inner()             
             listener.send('external',data)
         })
     } 
