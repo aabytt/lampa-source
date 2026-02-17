@@ -20,30 +20,35 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-      
+
       - name: Install dependencies
         run: npm install
 
       - name: Build
-        run: npm run start
+        run: npm run build
+
+      - name: Ensure dist exists
+        run: |
+          if [ ! -d "dist" ]; then
+            echo "ERROR: dist/ not found. Check your build output folder."
+            ls -la
+            exit 1
+          fi
+          ls -la dist
 
       - name: Deploy to target repo
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Клонируем deploy-репо
           rm -rf /tmp/deploy-repo
           git clone https://x-access-token:${{ secrets.DEPLOY_TOKEN }}@github.com/aabytt/aabytt.github.io.git /tmp/deploy-repo
 
-          # Очищаем всё внутри (кроме .git)
           find /tmp/deploy-repo -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
 
-          # Копируем сборку
           cp -R dist/* /tmp/deploy-repo/
 
-          # Коммитим и пушим
           cd /tmp/deploy-repo
           git add -A
           git commit -m "Deploy from source repo: $GITHUB_REPOSITORY @ $GITHUB_SHA" || echo "No changes to commit"
-          git push
+          git push origin main
