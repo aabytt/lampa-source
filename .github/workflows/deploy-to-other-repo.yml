@@ -1,4 +1,4 @@
-name: Build and Deploy to Another Repo
+name: Build and Deploy dest to aabytt.github.io
 
 on:
   push:
@@ -24,8 +24,7 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      # 1) Запускаем gulp (debug или default) в фоне, ждём пока появится dest/app.js, потом убиваем процесс
-      - name: Prebuild (run gulp in background until dest/app.js appears)
+      - name: Build dest (run gulp debug in background, then stop)
         shell: bash
         run: |
           set -euo pipefail
@@ -36,8 +35,8 @@ jobs:
           npx gulp debug &
           GULP_PID=$!
 
-          echo "Waiting for dest/app.js (max 180s)..."
-          for i in {1..180}; do
+          echo "Waiting for dest/app.js (max 240s)..."
+          for i in {1..240}; do
             if [ -f "dest/app.js" ]; then
               echo "OK: dest/app.js exists"
               break
@@ -58,26 +57,16 @@ jobs:
 
           echo "Stopping gulp (pid=$GULP_PID) to avoid CI hang..."
           kill $GULP_PID || true
-          # на всякий случай, если не убился мгновенно
           sleep 2
           kill -9 $GULP_PID || true
 
-      # 2) Теперь pack_github уже не упадёт на отсутствии dest/app.js
-      - name: Pack for GitHub
-        run: npx gulp pack_github
+          echo "dest/ contents (top):"
+          ls -la dest | head -n 200
 
-      - name: Ensure public exists
+      - name: Deploy dest to target repo
+        shell: bash
         run: |
-          if [ ! -d "public" ]; then
-            echo "ERROR: public/ not found"
-            ls -la
-            exit 1
-          fi
-          ls -la public | head -n 200
-
-      - name: Deploy to target repo
-        run: |
-          set -e
+          set -euo pipefail
 
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -85,11 +74,16 @@ jobs:
           rm -rf /tmp/deploy-repo
           git clone https://x-access-token:${{ secrets.DEPLOY_TOKEN }}@github.com/aabytt/aabytt.github.io.git /tmp/deploy-repo
 
+          # очистка всего кроме .git
           find /tmp/deploy-repo -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
 
-          cp -R public/. /tmp/deploy-repo/
+          # копируем СОДЕРЖИМОЕ dest в корень репо B
+          cp -R dest/. /tmp/deploy-repo/
 
           cd /tmp/deploy-repo
+          echo "Changes to commit:"
+          git status --porcelain || true
+
           git add -A
-          git commit -m "Deploy from $GITHUB_REPOSITORY @ $GITHUB_SHA" || echo "No changes to commit"
+          git commit -m "Deploy dest from $GITHUB_REPOSITORY @ $GITHUB_SHA" || echo "No changes to commit"
           git push origin main
