@@ -24,20 +24,41 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Build
+      - name: List gulp tasks (debug)
+        run: npx gulp --tasks-simple || true
+
+      - name: Build (gulp)
         run: npm run build
 
-      - name: Ensure dist exists
+      - name: Detect build output folder
+        id: out
         run: |
-          if [ ! -d "dist" ]; then
-            echo "ERROR: dist/ not found. Check your build output folder."
+          # Частые папки выхода для gulp/static
+          CANDIDATES=("dist" "build" "public" "docs" "release" "out")
+          FOUND=""
+          for d in "${CANDIDATES[@]}"; do
+            if [ -d "$d" ] && [ "$(find "$d" -type f | head -n 1)" != "" ]; then
+              FOUND="$d"
+              break
+            fi
+          done
+
+          if [ -z "$FOUND" ]; then
+            echo "ERROR: Could not detect output folder. Project root contents:"
             ls -la
+            echo "Try checking gulpfile.js to see where it writes files (dist/build/public/etc)."
             exit 1
           fi
-          ls -la dist
+
+          echo "Detected output folder: $FOUND"
+          echo "folder=$FOUND" >> $GITHUB_OUTPUT
+          ls -la "$FOUND" | head -n 200
 
       - name: Deploy to target repo
         run: |
+          set -e
+          OUT="${{ steps.out.outputs.folder }}"
+
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -46,9 +67,9 @@ jobs:
 
           find /tmp/deploy-repo -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
 
-          cp -R dist/* /tmp/deploy-repo/
+          cp -R "$OUT"/. /tmp/deploy-repo/
 
           cd /tmp/deploy-repo
           git add -A
-          git commit -m "Deploy from source repo: $GITHUB_REPOSITORY @ $GITHUB_SHA" || echo "No changes to commit"
+          git commit -m "Deploy from $GITHUB_REPOSITORY @ $GITHUB_SHA" || echo "No changes to commit"
           git push origin main
