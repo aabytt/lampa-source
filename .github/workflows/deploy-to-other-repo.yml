@@ -1,0 +1,50 @@
+name: Build and Deploy to Another Repo
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Deploy to target repo
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Клонируем deploy-репо
+          rm -rf /tmp/deploy-repo
+          git clone https://x-access-token:${{ secrets.DEPLOY_TOKEN }}@github.com/aabytt/aabytt.github.io.git /tmp/deploy-repo
+
+          # Очищаем всё внутри (кроме .git)
+          find /tmp/deploy-repo -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
+
+          # Копируем сборку
+          cp -R dist/* /tmp/deploy-repo/
+
+          # Коммитим и пушим
+          cd /tmp/deploy-repo
+          git add -A
+          git commit -m "Deploy from source repo: $GITHUB_REPOSITORY @ $GITHUB_SHA" || echo "No changes to commit"
+          git push
