@@ -59,4 +59,13 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
           rm -rf /tmp/deploy-repo
-          git clone https://x-access-token:${{ secrets.DEPLOY_TOKEN }}@github.com/aabytt/aaby_
+          git clone https://x-access-token:${{ secrets.DEPLOY_TOKEN }}@github.com/aabytt/aabytt.github.io.git /tmp/deploy-repo
+
+          find /tmp/deploy-repo -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
+
+          cp -R public/. /tmp/deploy-repo/
+
+          cd /tmp/deploy-repo
+          git add -A
+          git commit -m "Deploy from $GITHUB_REPOSITORY @ $GITHUB_SHA" || echo "No changes to commit"
+          git push origin main
