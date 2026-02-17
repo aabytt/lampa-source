@@ -5,8 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "gulp",
-    "build": "gulp build",
-    "build": "gulp default",
+    "build": "gulp build_web",
     "debug": "gulp debug",
     "test": "vitest",
     "doc": "gulp doc"
