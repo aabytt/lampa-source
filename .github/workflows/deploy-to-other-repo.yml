@@ -24,25 +24,49 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Prebuild (generate dest/app.js)
-        run: npx gulp debug
-
-      - name: Ensure dest/app.js exists
+      # 1) Запускаем gulp (debug или default) в фоне, ждём пока появится dest/app.js, потом убиваем процесс
+      - name: Prebuild (run gulp in background until dest/app.js appears)
+        shell: bash
         run: |
+          set -euo pipefail
+
+          rm -rf dest || true
+
+          echo "Starting gulp debug in background..."
+          npx gulp debug &
+          GULP_PID=$!
+
+          echo "Waiting for dest/app.js (max 180s)..."
+          for i in {1..180}; do
+            if [ -f "dest/app.js" ]; then
+              echo "OK: dest/app.js exists"
+              break
+            fi
+            sleep 1
+          done
+
           if [ ! -f "dest/app.js" ]; then
-            echo "ERROR: dest/app.js not found after prebuild."
-            echo "Listing dest/ and project root:"
+            echo "ERROR: dest/app.js was not created within timeout"
+            echo "Root:"
             ls -la || true
+            echo "dest/:"
             ls -la dest || true
-            find . -maxdepth 3 -type f -name "app.js" | head -n 50 || true
+            echo "Killing gulp (pid=$GULP_PID)"
+            kill $GULP_PID || true
             exit 1
           fi
-          ls -la dest | head -n 200
 
+          echo "Stopping gulp (pid=$GULP_PID) to avoid CI hang..."
+          kill $GULP_PID || true
+          # на всякий случай, если не убился мгновенно
+          sleep 2
+          kill -9 $GULP_PID || true
+
+      # 2) Теперь pack_github уже не упадёт на отсутствии dest/app.js
       - name: Pack for GitHub
         run: npx gulp pack_github
 
-      - name: Ensure output folder exists (public)
+      - name: Ensure public exists
         run: |
           if [ ! -d "public" ]; then
             echo "ERROR: public/ not found"
