@@ -1,4 +1,4 @@
-name: Build and Deploy dest to aabytt.github.io
+name: Build and Deploy GitHub build to aabytt.github.io
 
 on:
   push:
@@ -24,15 +24,13 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      # 1) Прогрев: запускаем debug (он watch), ждём, пока появится dest/app.js, и гасим процесс
       - name: Prebuild (run gulp debug in background until dest/app.js appears)
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf dest || true
+          rm -rf dest build || true
 
-          echo "Starting gulp debug in background..."
           npx gulp debug &
           GULP_PID=$!
 
@@ -47,47 +45,41 @@ jobs:
 
           if [ ! -f "dest/app.js" ]; then
             echo "ERROR: dest/app.js was not created within timeout"
-            echo "Root:"
             ls -la || true
-            echo "dest/:"
             ls -la dest || true
-            echo "Killing gulp (pid=$GULP_PID)"
             kill $GULP_PID || true
             exit 1
           fi
 
-          echo "Stopping gulp (pid=$GULP_PID) to avoid CI hang..."
+          echo "Stopping gulp to avoid CI hang..."
           kill $GULP_PID || true
           sleep 2
           kill -9 $GULP_PID || true
 
-          echo "dest/ contents (top) after prebuild:"
-          ls -la dest | head -n 200
-
-      # 2) Теперь делаем упаковку под GitHub (должна сгенерить нужные файлы, включая index.html)
-      - name: Pack for GitHub (one-shot)
+      - name: Pack for GitHub
         run: npx gulp pack_github
 
-      # 3) Проверим, что в dest есть index.html (или хотя бы покажем, что там лежит)
-      - name: Verify dest output
+      - name: Verify build output folder
         shell: bash
         run: |
           set -euo pipefail
-          echo "dest/ contents (top) after pack_github:"
-          ls -la dest | head -n 200
-
-          if [ ! -f "dest/index.html" ]; then
-            echo "ERROR: dest/index.html not found."
-            echo "Searching for index.html in repo (maxdepth 5):"
-            find . -maxdepth 5 -name "index.html" -type f -print || true
+          OUT="build/github/lampa"
+          if [ ! -f "$OUT/index.html" ]; then
+            echo "ERROR: $OUT/index.html not found"
+            echo "Listing build/github:"
+            ls -la build/github || true
+            echo "Listing build/github/lampa:"
+            ls -la "$OUT" || true
             exit 1
           fi
+          echo "OK: found $OUT/index.html"
+          ls -la "$OUT" | head -n 200
 
-      # 4) Деплой именно dest/ в корень репозитория B
-      - name: Deploy dest to target repo
+      - name: Deploy build/github/lampa to target repo
         shell: bash
         run: |
           set -euo pipefail
+          OUT="build/github/lampa"
 
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -97,12 +89,9 @@ jobs:
 
           find /tmp/deploy-repo -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
 
-          cp -R dest/. /tmp/deploy-repo/
+          cp -R "$OUT"/. /tmp/deploy-repo/
 
           cd /tmp/deploy-repo
-          echo "Changes to commit:"
-          git status --porcelain || true
-
           git add -A
-          git commit -m "Deploy dest from $GITHUB_REPOSITORY @ $GITHUB_SHA" || echo "No changes to commit"
+          git commit -m "Deploy $OUT from $GITHUB_REPOSITORY @ $GITHUB_SHA" || echo "No changes to commit"
           git push origin main
