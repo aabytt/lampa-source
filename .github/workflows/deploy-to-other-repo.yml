@@ -24,50 +24,37 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Show npm scripts
-        run: npm run
+      - name: Build (one-shot for GitHub)
+        run: npx gulp pack_github
 
-      - name: Show gulp tasks
-        run: npx gulp --tasks || true
-
-      - name: Build (try common one-shot gulp tasks)
+      - name: Ensure output folder exists
         run: |
-          set -e
-          # Список кандидатов: часто в gulp проектах одноразовая сборка называется так
-          CANDIDATES=("build" "web" "build:web" "build_web" "compile" "dist" "release" "prod" "production" "pack" "make" "bundle")
-          FOUND=""
-
-          # Получим список задач (если gulp это умеет) и попробуем найти совпадение
-          TASKS="$(npx gulp --tasks-simple 2>/dev/null || true)"
-          echo "---- gulp --tasks-simple ----"
-          echo "$TASKS"
-          echo "-----------------------------"
-
-          for t in "${CANDIDATES[@]}"; do
-            if echo "$TASKS" | grep -qx "$t"; then
-              FOUND="$t"
-              break
-            fi
-          done
-
-          if [ -z "$FOUND" ]; then
-            echo "No common one-shot task found automatically."
-            echo "You need to pick a task from the list above that builds once and exits (NOT watch)."
+          # Попробуем public/ как основной кандидат
+          if [ -d "public" ]; then
+            echo "Using output folder: public/"
+            ls -la public | head -n 200
+          else
+            echo "public/ not found. Listing repo root:"
+            ls -la
+            echo "If your build outputs elsewhere, change deploy copy path."
             exit 1
           fi
 
-          echo "Running gulp task: $FOUND"
-          npx gulp "$FOUND"
-
-      - name: Detect output folder
+      - name: Deploy to target repo
         run: |
-          # Поищем типовые папки вывода
-          for d in dist build public docs out release; do
-            if [ -d "$d" ]; then
-              echo "Found folder: $d"
-              find "$d" -maxdepth 2 -type f | head -n 20 || true
-            fi
-          done
+          set -e
 
-          # Если уверенно знаешь папку — можно потом зафиксировать её вместо авто-поиска
-          true
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          rm -rf /tmp/deploy-repo
+          git clone https://x-access-token:${{ secrets.DEPLOY_TOKEN }}@github.com/aabytt/aabytt.github.io.git /tmp/deploy-repo
+
+          find /tmp/deploy-repo -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
+
+          cp -R public/. /tmp/deploy-repo/
+
+          cd /tmp/deploy-repo
+          git add -A
+          git commit -m "Deploy from $GITHUB_REPOSITORY @ $GITHUB_SHA" || echo "No changes to commit"
+          git push origin main
